@@ -1,0 +1,71 @@
+{
+    "Verbosity": {
+        "level": 2
+    },
+    "Dataset": {
+        "name": "order_2",
+        "path": {
+            "train": "serialized_datasets/order_2-trainset.pkl",
+            "validate": "serialized_datasets/order_2-valset.pkl",
+            "test": "serialized_datasets/order_2-testset.pkl"
+        },
+        "format": "serialized",
+        "compositional_stratified_splitting": false,
+        "rotational_invariance": false,
+        "node_features": {
+            "name": ["atomic_number"],
+            "dim": [1],
+            "column_index": [0]
+        },
+        "graph_features": {
+            "name": ["delta_mbe_energy"],
+            "dim": [1],
+            "column_index": [0]
+        }
+    },
+    "NeuralNetwork": {
+        "Architecture": {
+            "mpnn_type": "EGNN",
+            "equivariance": true,
+            "radius": 6.0,
+            "max_neighbours": 32,
+            "periodic_boundary_conditions": false,
+            "pe_dim": 0,
+            "hidden_dim": 128,
+            "num_conv_layers": 5,
+            "output_heads": {
+                "graph": {
+                    "num_sharedlayers": 2,
+                    "dim_sharedlayers": 128,
+                    "num_headlayers": 2,
+                    "dim_headlayers": [64, 32]
+                }
+            },
+            "task_weights": [1.0]
+        },
+        "Variables_of_interest": {
+            "input_node_features": [0],
+            "output_names": ["delta_mbe_energy"],
+            "output_index": [0],
+            "output_dim": [1],
+            "type": ["graph"],
+            "denormalize_output": true
+        },
+        "Training": {
+            "num_epoch": 300,
+            "perc_train": 0.8,
+            "loss_function_type": "mae",
+            "batch_size": 32,
+            "continue": 0,
+            "Optimizer": {
+                "type": "AdamW",
+                "learning_rate": 1e-3
+            }
+        }
+    },
+    "Visualization": {
+        "plot_init_solution": true,
+        "plot_hist_solution": false,
+        "create_plots": true
+    }
+}
