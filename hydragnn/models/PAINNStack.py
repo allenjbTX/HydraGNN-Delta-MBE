@@ -14,14 +14,20 @@
 # Paper: https://arxiv.org/pdf/2102.03150
 
 
+from typing import Optional
+
 import torch
 from torch import nn
 from torch_geometric import nn as geom_nn
+from torch_geometric.nn import radius_graph
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.typing import OptTensor
 
 from .Base import Base
 from hydragnn.utils.model.operations import get_edge_vectors_and_lengths
+
+# Coulomb's constant in eV·Å/e² (matches positions in Å, charges in e, energy in eV).
+_COULOMB_CONSTANT_EV_ANGSTROM = 14.399645351950543
 
 
 class PAINNStack(Base):
@@ -38,13 +44,192 @@ class PAINNStack(Base):
         num_radial: int,
         radius: float,
         *args,
+        charge_conservation: bool = False,
+        charge_head_index: Optional[int] = None,
+        long_range_electrostatics: bool = False,
+        long_range_cutoff: Optional[float] = None,
+        coulomb_constant: float = _COULOMB_CONSTANT_EV_ANGSTROM,
+        energy_head_index: int = 0,
         **kwargs
     ):
         self.edge_dim = edge_dim
         self.num_radial = num_radial
         self.radius = radius
         self.is_edge_model = True  # specify that mpnn cannot handle edge features
+        self.charge_conservation = charge_conservation
+        self.charge_head_index = charge_head_index
+        if self.charge_conservation and self.charge_head_index is None:
+            raise ValueError(
+                "charge_conservation=True requires charge_head_index to be set "
+                "to the index of the output head producing per-atom charges."
+            )
+        self.long_range_electrostatics = long_range_electrostatics
+        self.long_range_cutoff = long_range_cutoff
+        self.coulomb_constant = coulomb_constant
+        self.energy_head_index = energy_head_index
+        if self.long_range_electrostatics and self.charge_head_index is None:
+            raise ValueError(
+                "long_range_electrostatics=True requires charge_head_index to "
+                "identify the output head producing per-atom charges."
+            )
         super().__init__(input_args, conv_args, *args, **kwargs)
+
+    @staticmethod
+    def _apply_charge_conservation(charges: torch.Tensor, data) -> torch.Tensor:
+        """Rescale per-atom partial charges so each molecule's charges sum to Q.
+
+        Implements PhysNet eq 14: q_i_tilde = q_i - (sum_j q_j - Q) / N_atoms.
+        ``data.total_charge`` is used as Q when present (shape ``(num_mol,)``
+        or ``(num_mol, 1)``); otherwise the system is assumed neutral.
+        """
+        if charges.dim() == 1:
+            charges = charges.unsqueeze(-1)
+            squeeze_back = True
+        else:
+            squeeze_back = False
+
+        batch = (
+            data.batch
+            if hasattr(data, "batch") and data.batch is not None
+            else torch.zeros(charges.shape[0], dtype=torch.long, device=charges.device)
+        )
+        num_mol = int(batch.max().item()) + 1
+        n_feat = charges.shape[1]
+
+        q_sum = charges.new_zeros((num_mol, n_feat))
+        q_sum.index_add_(0, batch, charges)
+
+        n_atoms = torch.bincount(batch, minlength=num_mol).to(dtype=charges.dtype)
+
+        q_ref = getattr(data, "total_charge", None)
+        if q_ref is None:
+            q_ref_mol = charges.new_zeros((num_mol, n_feat))
+        else:
+            q_ref_mol = q_ref.to(dtype=charges.dtype, device=charges.device).reshape(
+                num_mol, n_feat
+            )
+
+        delta = (q_sum - q_ref_mol) / n_atoms.unsqueeze(-1)
+        corrected = charges - delta[batch]
+        return corrected.squeeze(-1) if squeeze_back else corrected
+
+    @staticmethod
+    def _phys_net_phi(r: torch.Tensor, r_cut: float) -> torch.Tensor:
+        """PhysNet eq 8: smooth quintic cutoff (1 at r=0, 0 at r>=r_cut)."""
+        ratio = r / r_cut
+        inside = 1.0 - 6.0 * ratio ** 5 + 15.0 * ratio ** 4 - 10.0 * ratio ** 3
+        return torch.where(r < r_cut, inside, torch.zeros_like(r))
+
+    def _phys_net_chi(self, r: torch.Tensor) -> torch.Tensor:
+        """PhysNet eq 13: damped Coulomb kernel.
+
+        chi(r) = phi(2r) / sqrt(r^2 + 1) + (1 - phi(2r)) / r
+
+        For r >= radius/2 this is exactly 1/r; for r < radius/2 it smoothly
+        transitions to the damped form, removing the singularity at r=0.
+        """
+        phi = self._phys_net_phi(2.0 * r, self.radius)
+        damped = 1.0 / torch.sqrt(r * r + 1.0)
+        coulomb = 1.0 / r
+        return phi * damped + (1.0 - phi) * coulomb
+
+    def _compute_coulomb_energy(
+        self, charges: torch.Tensor, data
+    ) -> torch.Tensor:
+        """Long-range Coulomb energy per molecule (PhysNet eq 12, no D3).
+
+        Returns a tensor of shape ``(num_mol, 1)`` to match the energy head.
+        """
+        if charges.dim() == 1:
+            charges = charges.unsqueeze(-1)
+
+        pos = data.pos
+        batch = (
+            data.batch
+            if hasattr(data, "batch") and data.batch is not None
+            else torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+        )
+
+        # Build an intra-molecule pair list. ``radius_graph`` already excludes
+        # cross-graph pairs via ``batch`` and self-loops by default.
+        cutoff = self.long_range_cutoff
+        if cutoff is None or cutoff <= 0.0:
+            # Effectively all-pairs: pick a cutoff larger than any plausible
+            # molecular diameter so radius_graph returns every intra-graph pair.
+            cutoff = float("inf")
+            # radius_graph does not accept inf; fall back to a large finite value.
+            with torch.no_grad():
+                num_mol = int(batch.max().item()) + 1
+                max_diam = 0.0
+                for m in range(num_mol):
+                    mask = batch == m
+                    if mask.sum() < 2:
+                        continue
+                    pm = pos[mask]
+                    d = torch.cdist(pm, pm).max().item()
+                    if d > max_diam:
+                        max_diam = d
+                cutoff = max_diam + 1.0
+
+        # max_num_neighbors must be large enough to retain every neighbor for
+        # large molecules at long cutoff. Use the largest atom count we see.
+        with torch.no_grad():
+            max_n = int(torch.bincount(batch).max().item())
+
+        edge_index = radius_graph(
+            pos,
+            r=float(cutoff),
+            batch=batch,
+            loop=False,
+            max_num_neighbors=max(max_n - 1, 32),
+        )
+        # Keep each unordered pair only once.
+        src, dst = edge_index[0], edge_index[1]
+        mask = src < dst
+        i, j = src[mask], dst[mask]
+
+        num_mol = int(batch.max().item()) + 1
+        if i.numel() == 0:
+            return charges.new_zeros((num_mol, 1))
+
+        r_ij = (pos[i] - pos[j]).norm(dim=-1)
+        chi = self._phys_net_chi(r_ij)
+        q_i = charges[i, 0]
+        q_j = charges[j, 0]
+        pair_e = self.coulomb_constant * q_i * q_j * chi  # (num_pairs,)
+
+        mol_e = pair_e.new_zeros(num_mol)
+        mol_e.index_add_(0, batch[i], pair_e)
+        return mol_e.unsqueeze(-1)
+
+    def forward(self, data):
+        outputs = super().forward(data)
+        if not (self.charge_conservation or self.long_range_electrostatics):
+            return outputs
+
+        # Base.forward returns either ``outputs`` or ``(outputs, outputs_var)``
+        # depending on var_output; handle both.
+        if isinstance(outputs, tuple):
+            head_outputs, head_vars = outputs
+        else:
+            head_outputs, head_vars = outputs, None
+
+        if self.charge_conservation:
+            head_outputs[self.charge_head_index] = self._apply_charge_conservation(
+                head_outputs[self.charge_head_index], data
+            )
+
+        if self.long_range_electrostatics:
+            charges = head_outputs[self.charge_head_index]
+            coulomb_e = self._compute_coulomb_energy(charges, data)
+            energy = head_outputs[self.energy_head_index]
+            # Match shape: energy is (num_mol, head_dim); coulomb_e is
+            # (num_mol, 1). Broadcasting handles head_dim==1, the typical case.
+            head_outputs[self.energy_head_index] = energy + coulomb_e
+
+        if head_vars is not None:
+            return head_outputs, head_vars
+        return head_outputs
 
     def _init_conv(self):
         last_layer = 1 == self.num_conv_layers

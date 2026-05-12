@@ -89,6 +89,16 @@ def create_model_config(
         energy_weight=config["Architecture"].get("energy_weight", 0.0),
         energy_peratom_weight=config["Architecture"].get("energy_peratom_weight", 0.0),
         force_weight=config["Architecture"].get("force_weight", 0.0),
+        charge_conservation=config["Architecture"].get("charge_conservation", False),
+        charge_head_index=config["Architecture"].get("charge_head_index", None),
+        long_range_electrostatics=config["Architecture"].get(
+            "long_range_electrostatics", False
+        ),
+        long_range_cutoff=config["Architecture"].get("long_range_cutoff", None),
+        coulomb_constant=config["Architecture"].get(
+            "coulomb_constant", 14.399645351950543
+        ),
+        energy_head_index=config["Architecture"].get("energy_head_index", 0),
         use_graph_attr_conditioning=config["Architecture"].get(
             "use_graph_attr_conditioning", False
         ),
@@ -153,6 +163,12 @@ def create_model(
     energy_weight: float = 0.0,
     energy_peratom_weight: float = 0.0,
     force_weight: float = 0.0,
+    charge_conservation: bool = False,
+    charge_head_index: int = None,
+    long_range_electrostatics: bool = False,
+    long_range_cutoff: float = None,
+    coulomb_constant: float = 14.399645351950543,
+    energy_head_index: int = 0,
     use_graph_attr_conditioning: bool = False,
     graph_attr_conditioning_mode: str = "fuse_pool",
     graph_pooling: str = "mean",
@@ -507,6 +523,12 @@ def create_model(
             graph_pooling=graph_pooling,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            charge_conservation=charge_conservation,
+            charge_head_index=charge_head_index,
+            long_range_electrostatics=long_range_electrostatics,
+            long_range_cutoff=long_range_cutoff,
+            coulomb_constant=coulomb_constant,
+            energy_head_index=energy_head_index,
         )
 
     elif mpnn_type == "PNAEq":

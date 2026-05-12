@@ -278,6 +278,7 @@ def train_validate_test(
             verbosity,
             compute_grad_energy=compute_grad_energy,
             num_tasks=num_tasks,
+            precision=precision,
         )
 
         visualizer.create_scatter_plots(
@@ -334,6 +335,7 @@ def train_validate_test(
                 use_deepspeed=use_deepspeed,
                 compute_grad_energy=compute_grad_energy,
                 precision=precision,
+                max_grad_norm=config["Training"].get("max_grad_norm", None),
             )
             tr.stop("train")
             tr.disable()
@@ -636,6 +638,7 @@ def train(
     use_deepspeed=False,
     compute_grad_energy=False,
     precision="fp32",
+    max_grad_norm=None,
 ):
     if profiler is None:
         profiler = Profiler()
@@ -750,6 +753,10 @@ def train(
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
+            if max_grad_norm is not None and not use_deepspeed:
+                if scaler is not None:
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             if fsdp2_force_workaround and fsdp2_workaround_available:
                 _set_reshard_after_backward(model, True)
             if trace_level > 0:
